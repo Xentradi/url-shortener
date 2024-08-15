@@ -30,17 +30,6 @@ app.get('/', async (req, res) => {
   return res.redirect(redirectUrl);
 })
 
-/**
- * Handles the creation of a new shortened URL.
- *
- * @param {Object} req - The request object containing the original URL, creator, and expiration date.
- * @param {string} req.body.originalUrl - The original URL to be shortened.
- * @param {string} [req.body.creator] - The creator of the URL. Defaults to 'anonymous' if not provided.
- * @param {string} [req.body.expirationDate] - The expiration date of the shortened URL. Must be a valid date string.
- * @param {Object} res - The response object to send back the result.
- *
- * @returns {Object} - A JSON object containing the shortened URL details or an error message.
- */
 app.post('/shorten', async (req, res) => {
   let {originalUrl, creator, expirationDate} = req.body;
   expirationDate = expirationDate ? new Date(expirationDate) : null;
@@ -49,17 +38,16 @@ app.post('/shorten', async (req, res) => {
     return res.status(400).json({error: 'Missing original URL'});
   }
 
-  // Ensure URL has protocol (http or https)
-  if (!originalUrl.startsWith('http://') && !originalUrl.startsWith('https://')) {
-    originalUrl = `http://${originalUrl}`;
-  }
+  // Sanitize URL
+  originalUrl = sanitizeUrl(originalUrl);
+  console.log(`Original URL: ${originalUrl}`);
 
   // Validate URL format
-  if (!validator.isURL(originalUrl)) {
+  if (!validateUrl(originalUrl)) {
     return res.status(400).json({error: 'Invalid URL format'});
   }
 
-  const shortId = nanoid(6);
+  const shortId = await generateUniqueShortId(6);
 
   try {
     const newUrl = await Url.create({
@@ -75,7 +63,6 @@ app.post('/shorten', async (req, res) => {
   }
 
 })
-
 app.get('/:shortId', async (req, res) => {
   const {shortId} = req.params;
   try {
@@ -83,7 +70,6 @@ app.get('/:shortId', async (req, res) => {
 
     if (!urlRecord) {
       return res.status(404).json({error: 'URL not found'});
-
     }
 
     urlRecord.clicks++;
@@ -98,13 +84,11 @@ app.get('/:shortId', async (req, res) => {
 
     }
     await urlRecord.save();
-
     return res.redirect(urlRecord.originalUrl);
 
-
   } catch (error) {
+    console.error('Error retrieving URL', error);
     res.status(500).json({error: 'Error redirecting URL'});
-
   }
 })
 
@@ -115,10 +99,60 @@ mongoose.connection.on('connected', () => {
     console.log(`Server running on port ${port}`);
 
   });
-
 })
 
 mongoose.connection.on('error', (error) => {
   console.error('Failed to connect to MongoDB', error);
   process.exit(1);
 })
+
+mongoose.connection.on('disconnected', () => {
+  console.error('MongoDB connection disconnected');
+  process.exit(1);
+})
+
+process.on('SIGINT', () => {
+  mongoose.connection.close();
+  process.exit(0);
+});
+
+function sanitizeUrl(url) {
+  url = url.trim() // Trim leading/trailing whitespace
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = `http://${url}`;
+  }
+
+  url = url.replace(/[<>\"'`]/g, ''); // Remove or encode dangerous characters
+
+  return url;
+}
+
+function validateUrl(url) {
+  const options = {
+    require_protocol: true,
+    require_valid_protocol: true,
+    require_tld: true,
+    require_host: true,
+    require_valid_host: true,
+    allow_protocol_relative_urls: false
+  }
+  // Validate URL format
+  return validator.isURL(url, options);
+}
+
+async function generateUniqueShortId(length = 6) {
+  let shortId;
+  let existingUrl;
+  try {
+    do {
+      shortId = nanoid(6);
+      existingUrl = await Url.exists({shortId});
+    } while (existingUrl);
+  } catch (error) {
+    console.error('Error generating unique short ID', error);
+    throw new Error('Failed to generate unique short ID');
+  }
+
+  return shortId;
+}
+
