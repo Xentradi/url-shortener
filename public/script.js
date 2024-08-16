@@ -16,10 +16,6 @@ document.getElementById('urlForm').addEventListener('submit', async function (e)
       body: JSON.stringify({originalUrl}),
     });
 
-    // Log the raw response for inspection
-    const textResponse = await response.text();
-    console.log('Raw response:', textResponse);
-
     if (!response.ok) {
       throw new Error('Failed to shorten URL');
     }
