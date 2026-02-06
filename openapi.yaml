@@ -1,0 +1,1016 @@
+openapi: 3.1.0
+info:
+  title: X3N LinkHub API
+  version: 1.0.0
+  description: |
+    API for creating and managing short links.
+
+    Authentication model:
+    - `X-API-Key`: client key for `/shorten`.
+    - `X-Admin-Key`: admin key for `/admin/*` and `/docs`.
+    - `X-Admin-Nuke-Key`: second-factor header for `/admin/maintenance/nuke`.
+
+    Behavior notes:
+    - `POST /shorten` is idempotent per `(originalUrl, apiKeyId)` while a non-deleted record exists.
+    - Default TTL is 180 days when `expirationDate` is omitted.
+    - Indefinite links are supported by setting `expirationDate` to `null`, `"none"`, `"indefinite"`, or `"never"`.
+    - URL validation only allows `http`/`https`, blocks private/local IPs, blocks localhost/.local/.onion,
+      and blocks known shortener domains.
+servers:
+  - url: /
+tags:
+  - name: Health
+  - name: Public
+  - name: Admin API Keys
+  - name: Admin URLs
+  - name: Admin Maintenance
+  - name: Admin Audit
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service process is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      responses:
+        '200':
+          description: Service is connected to MongoDB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /shorten:
+    post:
+      tags: [Public]
+      summary: Create a short URL
+      description: |
+        Creates a short URL for the authenticated API key.
+
+        Idempotency:
+        - If an active, non-deleted record already exists with the same `originalUrl` and `apiKeyId`,
+          the existing record is returned.
+
+        TTL behavior:
+        - If `expirationDate` is omitted, default TTL is 180 days.
+        - If `expirationDate` is `null`/`none`/`indefinite`/`never`, the link is indefinite.
+        - Non-extended keys are capped to max TTL of 730 days.
+
+        Validation:
+        - Only `http` and `https` URLs are accepted.
+        - Private/local IP destinations are blocked.
+      security:
+        - ApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShortenRequest'
+      responses:
+        '200':
+          description: Existing or newly created short link
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Url'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing API key header
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Invalid API key or insufficient scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit or active-link quota exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /{shortId}:
+    get:
+      tags: [Public]
+      summary: Redirect to the original URL
+      description: |
+        Redirects using the short code.
+
+        Response behavior:
+        - `404` if no matching active record exists.
+        - `410` if the record exists but is expired.
+
+        Short code format:
+        - URL-safe characters `[A-Za-z0-9_-]`.
+        - Length is configured by `SHORT_ID_LENGTH` (default `6`).
+
+        Cache note:
+        - Redirect responses are not currently explicitly cache-controlled.
+          If edge caching is introduced later, behavior should be documented as cache-sensitive.
+      parameters:
+        - name: shortId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{6,64}$'
+      responses:
+        '302':
+          description: Redirect to original URL
+        '404':
+          description: URL not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: URL expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/api-keys:
+    get:
+      tags: [Admin API Keys]
+      summary: List API keys
+      security:
+        - AdminKey: []
+      responses:
+        '200':
+          description: API key list (hash excluded)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApiKey'
+        '401':
+          description: Missing admin key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Invalid admin key or insufficient scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      tags: [Admin API Keys]
+      summary: Create API key
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreateRequest'
+      responses:
+        '201':
+          description: Created. Raw key is returned once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithRaw'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/api-keys/{id}:
+    patch:
+      tags: [Admin API Keys]
+      summary: Update API key
+      description: Disabling a key expires all of its currently active URLs.
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyUpdateRequest'
+      responses:
+        '200':
+          description: Updated key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
+        '400':
+          description: No fields to update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [Admin API Keys]
+      summary: Delete API key
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/api-keys/{id}/rotate:
+    post:
+      tags: [Admin API Keys]
+      summary: Rotate API key
+      description: Returns the raw key once. Store it securely; it cannot be recovered later.
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Rotated key (with one-time raw value)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithRaw'
+        '404':
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/urls:
+    get:
+      tags: [Admin URLs]
+      summary: List URLs
+      description: |
+        Supports filtering, pagination, and sorting.
+
+        Soft delete semantics:
+        - Soft-deleted records have `deletedAt` populated and are excluded unless `includeDeleted=true`.
+        - Hard purge is controlled by `purgeAt` TTL behavior and maintenance jobs.
+
+        Pagination:
+        - `limit` and `offset` query params are supported.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: q
+          in: query
+          schema: {type: string}
+          description: Full-text-like match against shortId and originalUrl
+        - name: shortId
+          in: query
+          schema: {type: string}
+        - name: originalUrl
+          in: query
+          schema: {type: string}
+        - name: apiKeyId
+          in: query
+          schema: {type: string}
+        - name: createdFrom
+          in: query
+          schema: {type: string, format: date-time}
+        - name: createdTo
+          in: query
+          schema: {type: string, format: date-time}
+        - name: expiresFrom
+          in: query
+          schema: {type: string, format: date-time}
+        - name: expiresTo
+          in: query
+          schema: {type: string, format: date-time}
+        - name: expired
+          in: query
+          schema: {type: boolean}
+        - name: includeDeleted
+          in: query
+          schema: {type: boolean}
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [createdAt, lastClickAt, clicks, expirationDate, shortId, originalUrl]
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/OffsetParam'
+      responses:
+        '200':
+          description: URL page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUrls'
+
+  /admin/urls/{id}:
+    get:
+      tags: [Admin URLs]
+      summary: Get URL by database ID
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - name: includeDeleted
+          in: query
+          schema: {type: boolean}
+      responses:
+        '200':
+          description: URL record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Url'
+        '404':
+          description: URL not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      tags: [Admin URLs]
+      summary: Update URL
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminUrlUpdateRequest'
+      responses:
+        '200':
+          description: Updated URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Url'
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: URL not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [Admin URLs]
+      summary: Soft delete URL
+      description: Sets `deletedAt` and schedules hard purge via `purgeAt`.
+      security:
+        - AdminKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '204':
+          description: Soft deleted
+        '404':
+          description: URL not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/urls/by-short-id/{shortId}:
+    get:
+      tags: [Admin URLs]
+      summary: Get URL by short ID
+      security:
+        - AdminKey: []
+      parameters:
+        - name: shortId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: includeDeleted
+          in: query
+          schema: {type: boolean}
+      responses:
+        '200':
+          description: URL record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Url'
+        '404':
+          description: URL not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/maintenance/stats:
+    get:
+      tags: [Admin Maintenance]
+      summary: Get maintenance stats
+      security:
+        - AdminKey: []
+      responses:
+        '200':
+          description: Aggregated maintenance statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceStats'
+
+  /admin/maintenance/cleanup/expired:
+    post:
+      tags: [Admin Maintenance]
+      summary: Cleanup expired URLs
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/MaintenanceCleanupRequest'
+                - type: object
+                  properties:
+                    hardDelete:
+                      type: boolean
+                      default: false
+      responses:
+        '200':
+          description: Cleanup result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceResult'
+
+  /admin/maintenance/cleanup/deleted:
+    post:
+      tags: [Admin Maintenance]
+      summary: Hard-delete soft-deleted URLs older than N days
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/MaintenanceCleanupRequest'
+                - type: object
+                  properties:
+                    olderThanDays:
+                      type: integer
+                      default: 90
+      responses:
+        '200':
+          description: Cleanup result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceResult'
+
+  /admin/maintenance/cleanup/inactive:
+    post:
+      tags: [Admin Maintenance]
+      summary: Soft-delete inactive long-lived URLs
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/MaintenanceCleanupRequest'
+                - type: object
+                  properties:
+                    inactiveDays:
+                      type: integer
+                      default: 365
+      responses:
+        '200':
+          description: Cleanup result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceResult'
+
+  /admin/maintenance/cleanup/orphaned-keys:
+    post:
+      tags: [Admin Maintenance]
+      summary: Soft-delete URLs whose `apiKeyId` no longer exists
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MaintenanceCleanupRequest'
+      responses:
+        '200':
+          description: Cleanup result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceResult'
+
+  /admin/maintenance/backfill/purge-at:
+    post:
+      tags: [Admin Maintenance]
+      summary: Backfill `purgeAt` for legacy records
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MaintenanceCleanupRequest'
+      responses:
+        '200':
+          description: Backfill result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaintenanceResult'
+
+  /admin/maintenance/indexes/rebuild:
+    post:
+      tags: [Admin Maintenance]
+      summary: Rebuild MongoDB indexes
+      security:
+        - AdminKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dryRun:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Index rebuild status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  dryRun: {type: boolean}
+
+  /admin/maintenance/nuke:
+    post:
+      tags: [Admin Maintenance]
+      summary: Dangerous full wipe
+      description: Requires `X-Admin-Key` and `X-Admin-Nuke-Key`, plus `confirm=WIPE-ALL`.
+      security:
+        - AdminKey: []
+          AdminNukeKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NukeRequest'
+      responses:
+        '200':
+          description: Wipe completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NukeResult'
+        '400':
+          description: Missing or invalid confirm token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Invalid nuke key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/audit:
+    get:
+      tags: [Admin Audit]
+      summary: List admin audit logs
+      description: Supports date-range filters and offset/limit pagination.
+      security:
+        - AdminKey: []
+      parameters:
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: method
+          in: query
+          schema: {type: string}
+        - name: path
+          in: query
+          schema: {type: string}
+        - name: status
+          in: query
+          schema: {type: integer}
+        - name: requestId
+          in: query
+          schema: {type: string}
+        - name: ip
+          in: query
+          schema: {type: string}
+        - name: from
+          in: query
+          schema: {type: string, format: date-time}
+        - name: to
+          in: query
+          schema: {type: string, format: date-time}
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - $ref: '#/components/parameters/AuditLimitParam'
+        - $ref: '#/components/parameters/OffsetParam'
+      responses:
+        '200':
+          description: Audit page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAdminAudit'
+
+components:
+  securitySchemes:
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    AdminNukeKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Nuke-Key
+
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: MongoDB ObjectId
+    LimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    AuditLimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+    OffsetParam:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+      required: [ok]
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    Url:
+      type: object
+      properties:
+        _id:
+          type: string
+        shortId:
+          type: string
+        originalUrl:
+          type: string
+          format: uri
+        createdAt:
+          type: string
+          format: date-time
+        clicks:
+          type: integer
+        lastClickAt:
+          type: string
+          format: date-time
+          nullable: true
+        expirationDate:
+          type: string
+          format: date-time
+          nullable: true
+        deletedAt:
+          type: string
+          format: date-time
+          nullable: true
+        purgeAt:
+          type: string
+          format: date-time
+          nullable: true
+        apiKeyId:
+          type: string
+          nullable: true
+      required: [_id, shortId, originalUrl, createdAt, clicks]
+
+    ApiKey:
+      type: object
+      properties:
+        _id:
+          type: string
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastUsedIp:
+          type: string
+          nullable: true
+        lastUsedUserAgent:
+          type: string
+          nullable: true
+        usageCount:
+          type: integer
+        active:
+          type: boolean
+      required: [_id, name, scopes, createdAt, usageCount, active]
+
+    ApiKeyWithRaw:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        active:
+          type: boolean
+        scopes:
+          type: array
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+        apiKey:
+          type: string
+      required: [id, name, active, scopes, apiKey]
+
+    AdminAudit:
+      type: object
+      properties:
+        _id:
+          type: string
+        action:
+          type: string
+        method:
+          type: string
+        path:
+          type: string
+        status:
+          type: integer
+        requestId:
+          type: string
+          nullable: true
+        ip:
+          type: string
+          nullable: true
+        meta:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+      required: [_id, action, method, path, status, createdAt]
+
+    CreateShortenRequest:
+      type: object
+      properties:
+        originalUrl:
+          type: string
+          format: uri
+        expirationDate:
+          description: Date-time or null/none/indefinite/never for indefinite TTL
+          oneOf:
+            - type: string
+              format: date-time
+            - type: string
+              enum: [none, indefinite, never]
+            - type: 'null'
+      required: [originalUrl]
+
+    ApiKeyCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+      required: [name]
+
+    ApiKeyUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        active:
+          type: boolean
+        scopes:
+          type: array
+          items:
+            type: string
+      minProperties: 1
+
+    AdminUrlUpdateRequest:
+      type: object
+      properties:
+        originalUrl:
+          type: string
+          format: uri
+        expirationDate:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: string
+              enum: [none, indefinite, never]
+            - type: 'null'
+        clicks:
+          type: integer
+        lastClickAt:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        apiKeyId:
+          oneOf:
+            - type: string
+            - type: 'null'
+      minProperties: 1
+
+    PaginatedUrls:
+      type: object
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Url'
+      required: [total, limit, offset, items]
+
+    MaintenanceCleanupRequest:
+      type: object
+      properties:
+        dryRun:
+          type: boolean
+          default: true
+        limit:
+          type: integer
+          default: 1000
+      additionalProperties: true
+
+    MaintenanceResult:
+      type: object
+      properties:
+        matched:
+          type: integer
+        affected:
+          type: integer
+      required: [matched, affected]
+
+    MaintenanceStats:
+      type: object
+      properties:
+        total: {type: integer}
+        deleted: {type: integer}
+        expired: {type: integer}
+        active: {type: integer}
+        longTtl: {type: integer}
+        purgeScheduled: {type: integer}
+      required: [total, deleted, expired, active, longTtl, purgeScheduled]
+
+    NukeRequest:
+      type: object
+      properties:
+        confirm:
+          type: string
+          enum: [WIPE-ALL]
+        alsoApiKeys:
+          type: boolean
+          default: false
+      required: [confirm]
+
+    NukeResult:
+      type: object
+      properties:
+        urlsDeleted:
+          type: integer
+        apiKeysDeleted:
+          type: integer
+      required: [urlsDeleted, apiKeysDeleted]
+
+    PaginatedAdminAudit:
+      type: object
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminAudit'
+      required: [total, limit, offset, items]
