@@ -11,14 +11,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Xentradi/x3n-linkhub.git"
+    "url": "git+https://github.com/Xentradi/url-shortener.git"
   },
   "author": "Xentradi",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/Xentradi/x3n-linkhub/issues"
+    "url": "https://github.com/Xentradi/url-shortener/issues"
   },
-  "homepage": "https://github.com/Xentradi/x3n-linkhub#readme",
+  "homepage": "https://github.com/Xentradi/url-shortener#readme",
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
