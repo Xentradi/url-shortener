@@ -4,6 +4,7 @@
   "description": "Production link shortener and management service",
   "main": "index.js",
   "type": "module",
+  "packageManager": "pnpm@10.6.0",
   "scripts": {
     "start": "node index.js",
     "bootstrap:admin": "node scripts/bootstrap-admin.js",
