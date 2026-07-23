@@ -18,6 +18,7 @@ import ApiKey from './models/apiKeyModel.js'
 import AdminAudit from './models/adminAuditModel.js'
 import blocklist from './blocklist.json' with {type: 'json'};
 import logger from './logger.js';
+import {registerWebUi} from './web-ui.js';
 
 const port = process.env.PORT || 3000;
 const dbUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/urlShortener';
@@ -40,17 +41,10 @@ const MAX_ACTIVE_LINKS_PER_KEY = 50000;
 const DEFAULT_JSON_LIMIT = '100kb';
 const DOCS_SESSION_COOKIE = 'docs_auth';
 const DOCS_SESSION_TTL_SECONDS = 60 * 10;
-const UI_SESSION_COOKIE = 'ui_session';
-const UI_SESSION_REMEMBER_SECONDS = 60 * 60 * 24 * 31;
-const UI_SESSION_SHORT_SECONDS = 60 * 60 * 12;
-const UI_SESSION_REMEMBER_MAX_SECONDS = 60 * 60 * 24 * 90;
-const UI_SESSION_SHORT_MAX_SECONDS = 60 * 60 * 24 * 7;
 const DOCS_SESSION_SECRET = process.env.DOCS_SESSION_SECRET
   || API_KEY_PEPPER
   || ADMIN_NUKE_KEY
   || crypto.randomBytes(32).toString('hex');
-const UI_SESSION_SECRET = process.env.UI_SESSION_SECRET
-  || DOCS_SESSION_SECRET;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const openApiFilePath = path.join(__dirname, 'openapi.yaml');
@@ -87,13 +81,6 @@ const apiKeyLimiter = rateLimit({
   message: 'Too many requests for this API key, please try again later.'
 });
 
-const uiLoginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 25,
-  handler: (req, res) => {
-    return redirectUiWithMessage(res, 'error', 'Too many login attempts. Please try again later.');
-  },
-});
 
 const app = express();
 
@@ -120,180 +107,47 @@ app.use((req, res, next) => {
   return next();
 });
 
-app.use('/admin', requireApiHost, adminKeyAuth, requireScope('admin:*'));
-app.use('/admin', adminAudit);
 
 mongoose.connect(dbUri, {});
 
 app.use(express.json({limit: DEFAULT_JSON_LIMIT}));
 app.use(express.urlencoded({extended: false, limit: '20kb'}));
-app.use('/ui-assets', requireWebHost, express.static('public'));
 
-app.get('/', uiSessionOptionalAuth, async (req, res) => {
-  if (isApiHost(req) && !isWebHost(req)) {
-    return res.status(200).json({
-      ok: true,
-      service: 'x3n-linkhub-api',
-      docs: '/docs',
-    });
-  }
-  if (!isWebHost(req)) {
-    return res.status(404).json({error: 'Not found'});
-  }
-
-  const errorMessage = readQueryValue(req.query.error);
-  const successMessage = readQueryValue(req.query.success);
-  const createdShortId = readQueryValue(req.query.created);
-
-  if (!req.uiAuth) {
-    res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).send(renderUiLoginPage({
-      errorMessage,
-      successMessage,
-    }));
-  }
-
-  const apiKeyId = req.uiAuth.apiKey?._id || null;
-  if (!apiKeyId) {
-    clearUiSessionCookie(res);
-    return redirectUiWithMessage(res, 'error', 'Session is invalid. Please log in again.');
-  }
-
-  try {
-    const [myUrls, adminData] = await Promise.all([
-      Url.find({apiKeyId, deletedAt: null})
-        .sort({createdAt: -1})
-        .limit(200)
-        .lean(),
-      req.uiAuth.isAdmin ? fetchUiAdminData() : Promise.resolve(null),
-    ]);
-
-    res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).send(renderUiDashboardPage({
-      request: req,
-      session: req.uiAuth,
-      myUrls,
-      adminData,
-      errorMessage,
-      successMessage,
-      createdShortId,
-    }));
-  } catch (error) {
-    logger.error('Failed to render shortener UI', {error: String(error)});
-    return res.status(500).send(renderUiLoginPage({
-      errorMessage: 'Failed to load dashboard',
-      successMessage: '',
-    }));
-  }
+const webUi = registerWebUi({
+  app,
+  logger,
+  Url,
+  ApiKey,
+  spamLimiter,
+  authenticateKeyByValue,
+  hasScope,
+  parseExpirationDate,
+  sanitizeUrl,
+  validateUrl,
+  isExpired,
+  getExpirationPurgeAt,
+  generateUniqueShortId,
+  maxTtlDays: MAX_TTL_DAYS,
+  maxActiveLinksPerKey: MAX_ACTIVE_LINKS_PER_KEY,
+  shortIdLength: SHORT_ID_LENGTH,
+  apiHost: API_HOST,
+  isWebHost,
+  isLocalHost,
+  requireWebHost,
+  isValidObjectId,
 });
 
-app.get('/shorten', (req, res) => {
-  if (isWebHost(req)) {
-    return res.redirect('/');
-  }
-  return res.status(404).json({error: 'Not found'});
-});
+app.use('/admin', createAdminRouteAuth({
+  uiAdminSessionAuth: webUi.adminSessionAuth,
+}));
+app.use('/admin', adminAudit);
 
-app.post('/login', requireWebHost, uiLoginLimiter, async (req, res) => {
-  const accessKey = String(req.body?.accessKey || '').trim();
-  const rememberMe = req.body?.rememberMe === 'on';
-
-  if (!accessKey) {
-    return redirectUiWithMessage(res, 'error', 'Missing key');
-  }
-
-  try {
-    const keyRecord = await authenticateKeyByValue(accessKey, req);
-    if (!keyRecord) {
-      return redirectUiWithMessage(res, 'error', 'Invalid key');
-    }
-
-    const sessionBundle = createUiSession({
-      apiKeyId: keyRecord._id?.toString() || '',
-      rememberMe,
-    });
-    setUiSessionCookie(res, sessionBundle.token, sessionBundle.maxAgeSeconds);
-    return redirectUiWithMessage(res, 'success', 'Login successful');
-  } catch (error) {
-    logger.error('Failed to create UI session', {error: String(error)});
-    return redirectUiWithMessage(res, 'error', 'Failed to log in');
-  }
-});
-
-app.post('/logout', requireWebHost, uiSessionOptionalAuth, uiSessionRequiredAuth, requireUiCsrf, (req, res) => {
-  clearUiSessionCookie(res);
-  return redirectUiWithMessage(res, 'success', 'Logged out');
-});
-
-app.post('/create', requireWebHost, spamLimiter, uiSessionOptionalAuth, uiSessionRequiredAuth, requireUiCsrf, async (req, res) => {
-  if (!hasScope(req.uiAuth.apiKey, 'shorten:write') && !req.uiAuth.isAdmin) {
-    return redirectUiWithMessage(res, 'error', 'This key is missing shorten:write scope');
-  }
-
-  let originalUrl = req.body?.originalUrl;
-  if (!originalUrl) {
-    return redirectUiWithMessage(res, 'error', 'Missing original URL');
-  }
-
-  originalUrl = sanitizeUrl(String(originalUrl));
-  const validation = validateUrl(originalUrl, {blockHost: req.hostname});
-  if (!validation.ok) {
-    return redirectUiWithMessage(res, 'error', validation.error);
-  }
-
-  const rawExpirationInput = readFormValue(req.body?.expirationDate);
-  const hasExpiration = rawExpirationInput !== undefined;
-  const canUseExtendedTtl = req.uiAuth.isAdmin
-    || hasScope(req.uiAuth.apiKey, 'ttl:extended')
-    || hasScope(req.uiAuth.apiKey, 'ttl:*');
-  const expirationResult = parseExpirationDate(rawExpirationInput, {
-    allowIndefinite: true,
-    applyDefault: !hasExpiration,
-    maxDays: canUseExtendedTtl ? null : MAX_TTL_DAYS,
+app.get('/', requireApiHost, (req, res) => {
+  return res.status(200).json({
+    ok: true,
+    service: 'x3n-linkhub-api',
+    docs: '/docs',
   });
-  if (!expirationResult.ok) {
-    return redirectUiWithMessage(res, 'error', expirationResult.error);
-  }
-  const expirationDate = expirationResult.value;
-
-  try {
-    const existing = await Url.findOne({
-      originalUrl,
-      apiKeyId: req.uiAuth.apiKey._id,
-      deletedAt: null,
-    });
-    if (existing) {
-      if (isExpired(existing.expirationDate)) {
-        existing.expirationDate = expirationDate;
-        existing.purgeAt = getExpirationPurgeAt(expirationDate);
-        await existing.save();
-      }
-      return redirectUiAfterCreate(res, existing.shortId, 'Reused existing short URL');
-    }
-
-    const now = new Date();
-    const activeLinkCount = await Url.countDocuments({
-      apiKeyId: req.uiAuth.apiKey._id,
-      deletedAt: null,
-      $or: [{expirationDate: null}, {expirationDate: {$gt: now}}],
-    });
-    if (activeLinkCount >= MAX_ACTIVE_LINKS_PER_KEY) {
-      return redirectUiWithMessage(res, 'error', 'Active link limit reached for this API key');
-    }
-
-    const shortId = await generateUniqueShortId(SHORT_ID_LENGTH);
-    const newUrl = await Url.create({
-      shortId,
-      originalUrl,
-      expirationDate,
-      purgeAt: getExpirationPurgeAt(expirationDate),
-      apiKeyId: req.uiAuth.apiKey._id,
-    });
-    return redirectUiAfterCreate(res, newUrl.shortId, 'Short URL created');
-  } catch (error) {
-    logger.error('Failed to create URL from UI', {error: String(error)});
-    return redirectUiWithMessage(res, 'error', 'Failed to create short URL');
-  }
 });
 
 app.get('/docs', requireApiHost, docsAuth, (req, res, next) => {
@@ -1057,33 +911,6 @@ app.post('/shorten', requireApiHost, spamLimiter, apiKeyAuth, requireScope('shor
   }
 
 })
-app.get(`/:shortId([A-Za-z0-9_-]{${SHORT_ID_LENGTH}})`, async (req, res) => {
-  if (!isWebHost(req)) {
-    return res.status(404).json({error: 'Not found'});
-  }
-  const {shortId} = req.params;
-  try {
-    const urlRecord = await Url.findOne({shortId, deletedAt: null});
-
-    if (!urlRecord) {
-      return res.status(404).json({error: 'URL not found'});
-    }
-
-    if (isExpired(urlRecord.expirationDate)) {
-      return res.status(410).json({error: 'URL expired'});
-    }
-
-    await Url.updateOne(
-      {_id: urlRecord._id},
-      {$inc: {clicks: 1}, $set: {lastClickAt: new Date()}}
-    );
-    return res.redirect(urlRecord.originalUrl);
-
-  } catch (error) {
-    logger.error('Error retrieving URL', {error: String(error)});
-    res.status(500).json({error: 'Error redirecting URL'});
-  }
-})
 
 
 mongoose.connection.on('connected', () => {
@@ -1384,6 +1211,29 @@ async function adminKeyAuth(req, res, next) {
   });
 }
 
+function createAdminRouteAuth({uiAdminSessionAuth}) {
+  return (req, res, next) => {
+    const isApi = isApiHost(req);
+    const isWeb = isWebHost(req);
+    if (!isApi && !isWeb) {
+      return res.status(404).json({error: 'Not found'});
+    }
+
+    const hasAdminHeader = Boolean(req.get('x-admin-key'));
+    if (isApi && (hasAdminHeader || !isWeb)) {
+      return adminKeyAuth(req, res, () => {
+        if (!hasScope(req.apiKey, 'admin:*')) {
+          return res.status(403).json({error: 'Insufficient scope'});
+        }
+        return next();
+      });
+    }
+
+    return uiAdminSessionAuth(req, res, next);
+  };
+}
+
+
 async function docsAuth(req, res, next) {
   const existingSession = getDocsSession(req);
   if (existingSession) {
@@ -1519,484 +1369,6 @@ function requireWebHost(req, res, next) {
   return res.status(404).json({error: 'Not found'});
 }
 
-async function fetchUiAdminData() {
-  const now = new Date();
-  const twoYears = new Date();
-  twoYears.setFullYear(twoYears.getFullYear() + 2);
-
-  const [statsCounts, apiKeys, recentUrls] = await Promise.all([
-    Promise.all([
-      Url.countDocuments({}),
-      Url.countDocuments({deletedAt: {$ne: null}}),
-      Url.countDocuments({deletedAt: null, expirationDate: {$lte: now}}),
-      Url.countDocuments({
-        deletedAt: null,
-        $or: [{expirationDate: null}, {expirationDate: {$gt: now}}],
-      }),
-      Url.countDocuments({
-        deletedAt: null,
-        $or: [{expirationDate: null}, {expirationDate: {$gt: twoYears}}],
-      }),
-      Url.countDocuments({purgeAt: {$ne: null}}),
-    ]),
-    ApiKey.find({}, '-keyHash')
-      .sort({createdAt: -1})
-      .limit(50)
-      .lean(),
-    Url.find({deletedAt: null})
-      .sort({createdAt: -1})
-      .limit(100)
-      .lean(),
-  ]);
-
-  return {
-    stats: {
-      total: statsCounts[0],
-      deleted: statsCounts[1],
-      expired: statsCounts[2],
-      active: statsCounts[3],
-      longTtl: statsCounts[4],
-      purgeScheduled: statsCounts[5],
-    },
-    apiKeys,
-    recentUrls,
-  };
-}
-
-async function uiSessionOptionalAuth(req, res, next) {
-  const session = getUiSession(req);
-  if (!session) {
-    return next();
-  }
-
-  if (!session.apiKeyId || !isValidObjectId(session.apiKeyId) || !session.csrfToken) {
-    clearUiSessionCookie(res);
-    return next();
-  }
-
-  try {
-    const keyRecord = await ApiKey.findOne({_id: session.apiKeyId, active: true});
-    if (!keyRecord) {
-      clearUiSessionCookie(res);
-      return next();
-    }
-
-    const refreshed = refreshUiSession(session);
-    if (refreshed) {
-      setUiSessionCookie(res, refreshed.token, refreshed.maxAgeSeconds);
-    }
-
-    req.uiAuth = {
-      apiKey: keyRecord,
-      isAdmin: hasScope(keyRecord, 'admin:*'),
-      csrfToken: session.csrfToken,
-      rememberMe: session.rememberMe,
-    };
-    req.apiKey = keyRecord;
-    res.locals.apiKeyId = keyRecord._id?.toString() || null;
-    return next();
-  } catch (error) {
-    logger.error('Failed to authenticate UI session', {error: String(error)});
-    return res.status(500).send(renderUiLoginPage({
-      errorMessage: 'Failed to authenticate session',
-      successMessage: '',
-    }));
-  }
-}
-
-function uiSessionRequiredAuth(req, res, next) {
-  if (!req.uiAuth) {
-    return redirectUiWithMessage(res, 'error', 'Please log in');
-  }
-  return next();
-}
-
-function requireUiCsrf(req, res, next) {
-  const expected = req.uiAuth?.csrfToken;
-  const provided = String(req.body?.csrfToken || '').trim();
-  if (!expected || !provided) {
-    return redirectUiWithMessage(res, 'error', 'Session verification failed');
-  }
-  if (!timingSafeEqual(provided, expected)) {
-    return redirectUiWithMessage(res, 'error', 'Session verification failed');
-  }
-  return next();
-}
-
-function createUiSession({apiKeyId, rememberMe}) {
-  const now = Math.floor(Date.now() / 1000);
-  const ttlSeconds = rememberMe ? UI_SESSION_REMEMBER_SECONDS : UI_SESSION_SHORT_SECONDS;
-  const maxWindowSeconds = rememberMe ? UI_SESSION_REMEMBER_MAX_SECONDS : UI_SESSION_SHORT_MAX_SECONDS;
-  const maxExp = now + maxWindowSeconds;
-  const payload = {
-    apiKeyId,
-    rememberMe: Boolean(rememberMe),
-    csrfToken: crypto.randomBytes(16).toString('hex'),
-    iat: now,
-    exp: Math.min(now + ttlSeconds, maxExp),
-    maxExp,
-  };
-
-  return {
-    token: encodeUiSession(payload),
-    maxAgeSeconds: ttlSeconds,
-  };
-}
-
-function refreshUiSession(session) {
-  const now = Math.floor(Date.now() / 1000);
-  const ttlSeconds = session.rememberMe ? UI_SESSION_REMEMBER_SECONDS : UI_SESSION_SHORT_SECONDS;
-  const nextExp = Math.min(now + ttlSeconds, session.maxExp);
-  if (nextExp <= session.exp) {
-    return null;
-  }
-
-  const payload = {
-    ...session,
-    exp: nextExp,
-  };
-
-  return {
-    token: encodeUiSession(payload),
-    maxAgeSeconds: Math.max(nextExp - now, 0),
-  };
-}
-
-function encodeUiSession(payload) {
-  const encodedPayload = base64urlEncode(JSON.stringify(payload));
-  const signature = signUiSession(encodedPayload);
-  return `${encodedPayload}.${signature}`;
-}
-
-function getUiSession(req) {
-  const cookieHeader = req.headers.cookie || '';
-  const cookies = parseCookies(cookieHeader);
-  const token = cookies[UI_SESSION_COOKIE];
-  if (!token) return null;
-
-  const [encodedPayload, signature] = token.split('.');
-  if (!encodedPayload || !signature) return null;
-
-  const expectedSignature = signUiSession(encodedPayload);
-  if (!timingSafeEqual(signature, expectedSignature)) {
-    return null;
-  }
-
-  try {
-    const json = Buffer.from(encodedPayload, 'base64url').toString('utf8');
-    const payload = JSON.parse(json);
-    const now = Math.floor(Date.now() / 1000);
-    if (!payload?.exp || !payload?.maxExp || now >= Number(payload.exp) || now >= Number(payload.maxExp)) {
-      return null;
-    }
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-function signUiSession(value) {
-  return crypto.createHmac('sha256', UI_SESSION_SECRET).update(value).digest('hex');
-}
-
-function setUiSessionCookie(res, token, maxAgeSeconds) {
-  const cookieParts = [
-    `${UI_SESSION_COOKIE}=${token}`,
-    'Path=/',
-    `Max-Age=${Math.max(Number(maxAgeSeconds) || 0, 0)}`,
-    'HttpOnly',
-    'SameSite=Lax',
-  ];
-  if (process.env.NODE_ENV === 'production') {
-    cookieParts.push('Secure');
-  }
-  res.setHeader('Set-Cookie', cookieParts.join('; '));
-}
-
-function clearUiSessionCookie(res) {
-  const cookieParts = [
-    `${UI_SESSION_COOKIE}=`,
-    'Path=/',
-    'Max-Age=0',
-    'HttpOnly',
-    'SameSite=Lax',
-  ];
-  if (process.env.NODE_ENV === 'production') {
-    cookieParts.push('Secure');
-  }
-  res.setHeader('Set-Cookie', cookieParts.join('; '));
-}
-
-function redirectUiWithMessage(res, type, message) {
-  const safeType = type === 'success' ? 'success' : 'error';
-  const safeMessage = encodeURIComponent(String(message || '').slice(0, 180));
-  return res.redirect(`/?${safeType}=${safeMessage}`);
-}
-
-function redirectUiAfterCreate(res, shortId, successMessage) {
-  const params = new URLSearchParams();
-  params.set('created', shortId);
-  params.set('success', successMessage);
-  return res.redirect(`/?${params.toString()}`);
-}
-
-function readQueryValue(value) {
-  if (Array.isArray(value)) return String(value[0] || '').trim();
-  if (value === undefined || value === null) return '';
-  return String(value).trim();
-}
-
-function readFormValue(value) {
-  if (value === undefined || value === null) return undefined;
-  const normalized = String(value).trim();
-  return normalized ? normalized : undefined;
-}
-
-function getRequestBaseUrl(req) {
-  const forwardedProto = req.headers['x-forwarded-proto'];
-  const protocol = forwardedProto
-    ? String(forwardedProto).split(',')[0].trim()
-    : req.protocol;
-  const host = req.get('host');
-  return `${protocol}://${host}`;
-}
-
-function getApiDocsUrl(req) {
-  if (isLocalHost(req)) {
-    return '/docs';
-  }
-  const forwardedProto = req.headers['x-forwarded-proto'];
-  const protocol = forwardedProto
-    ? String(forwardedProto).split(',')[0].trim()
-    : req.protocol;
-  return `${protocol}://${API_HOST}/docs`;
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function formatDateTime(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '—';
-  return date.toISOString().replace('T', ' ').replace('.000Z', ' UTC');
-}
-
-function renderUiLoginPage({errorMessage, successMessage}) {
-  const error = errorMessage ? `<div class="ui-alert ui-alert-error">${escapeHtml(errorMessage)}</div>` : '';
-  const success = successMessage ? `<div class="ui-alert ui-alert-success">${escapeHtml(successMessage)}</div>` : '';
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>X3N LinkHub Login</title>
-  <link rel="stylesheet" href="/ui-assets/ui.css">
-</head>
-<body class="ui-body">
-  <main class="ui-shell ui-shell-login">
-    <section class="ui-card">
-      <h1>X3N LinkHub</h1>
-      <p class="ui-muted">Authenticate with an API key or admin key. The raw key is not stored in browser storage.</p>
-      ${error}
-      ${success}
-      <form method="post" action="/login" class="ui-form">
-        <label for="accessKey">Access key</label>
-        <input id="accessKey" name="accessKey" type="password" autocomplete="current-password" required>
-        <label class="ui-check"><input type="checkbox" name="rememberMe"> Remember me for 31 days</label>
-        <button type="submit">Authenticate</button>
-      </form>
-    </section>
-  </main>
-</body>
-</html>`;
-}
-
-function renderUiDashboardPage({
-  request,
-  session,
-  myUrls,
-  adminData,
-  errorMessage,
-  successMessage,
-  createdShortId,
-}) {
-  const shortenerBase = getRequestBaseUrl(request);
-  const apiDocsUrl = getApiDocsUrl(request);
-  const roleLabel = session.isAdmin ? 'Admin Session' : 'User Session';
-  const roleClass = session.isAdmin ? 'ui-pill-admin' : 'ui-pill-user';
-
-  const createdBlock = createdShortId
-    ? `<div class="ui-alert ui-alert-success">Latest short URL:
-        <a href="/${escapeHtml(encodeURIComponent(createdShortId))}" target="_blank" rel="noopener">
-          ${escapeHtml(`${shortenerBase}/${createdShortId}`)}
-        </a>
-      </div>`
-    : '';
-  const error = errorMessage ? `<div class="ui-alert ui-alert-error">${escapeHtml(errorMessage)}</div>` : '';
-  const success = successMessage ? `<div class="ui-alert ui-alert-success">${escapeHtml(successMessage)}</div>` : '';
-
-  const myRows = myUrls.length
-    ? myUrls.map((item) => {
-      const shortUrl = `${shortenerBase}/${item.shortId}`;
-      const expires = item.expirationDate ? formatDateTime(item.expirationDate) : 'Indefinite';
-      return `<tr>
-        <td><a href="/${escapeHtml(encodeURIComponent(item.shortId))}" target="_blank" rel="noopener">${escapeHtml(shortUrl)}</a></td>
-        <td class="ui-break">${escapeHtml(item.originalUrl || '')}</td>
-        <td>${escapeHtml(formatDateTime(item.createdAt))}</td>
-        <td>${escapeHtml(expires)}</td>
-        <td>${escapeHtml(String(item.clicks || 0))}</td>
-      </tr>`;
-    }).join('')
-    : '<tr><td colspan="5" class="ui-muted">No links yet.</td></tr>';
-
-  const adminPanels = adminData ? renderUiAdminPanels({adminData, shortenerBase, apiDocsUrl}) : '';
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>X3N LinkHub Dashboard</title>
-  <link rel="stylesheet" href="/ui-assets/ui.css">
-</head>
-<body class="ui-body">
-  <main class="ui-shell">
-    <header class="ui-topbar">
-      <div>
-        <h1>X3N LinkHub</h1>
-        <p class="ui-muted">Signed in as <strong>${escapeHtml(session.apiKey.name || 'Unnamed key')}</strong></p>
-      </div>
-      <div class="ui-topbar-actions">
-        <span class="ui-pill ${roleClass}">${escapeHtml(roleLabel)}</span>
-        <form method="post" action="/logout">
-          <input type="hidden" name="csrfToken" value="${escapeHtml(session.csrfToken)}">
-          <button type="submit" class="ui-btn-secondary">Log out</button>
-        </form>
-      </div>
-    </header>
-
-    ${error}
-    ${success}
-    ${createdBlock}
-
-    <section class="ui-card">
-      <h2>Create short URL</h2>
-      <form method="post" action="/create" class="ui-form">
-        <input type="hidden" name="csrfToken" value="${escapeHtml(session.csrfToken)}">
-        <label for="originalUrl">Original URL</label>
-        <input id="originalUrl" name="originalUrl" type="url" placeholder="https://example.com/path" required>
-        <label for="expirationDate">Expiration (optional)</label>
-        <input id="expirationDate" name="expirationDate" type="text" placeholder="ISO datetime, or indefinite">
-        <button type="submit">Shorten</button>
-      </form>
-    </section>
-
-    <section class="ui-card">
-      <h2>My links</h2>
-      <div class="ui-table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Short URL</th>
-              <th>Original URL</th>
-              <th>Created</th>
-              <th>Expires</th>
-              <th>Clicks</th>
-            </tr>
-          </thead>
-          <tbody>${myRows}</tbody>
-        </table>
-      </div>
-    </section>
-
-    ${adminPanels}
-  </main>
-</body>
-</html>`;
-}
-
-function renderUiAdminPanels({adminData, shortenerBase, apiDocsUrl}) {
-  const stats = adminData.stats;
-  const recentRows = adminData.recentUrls.length
-    ? adminData.recentUrls.map((item) => {
-      const shortUrl = `${shortenerBase}/${item.shortId}`;
-      return `<tr>
-        <td><a href="/${escapeHtml(encodeURIComponent(item.shortId))}" target="_blank" rel="noopener">${escapeHtml(shortUrl)}</a></td>
-        <td class="ui-break">${escapeHtml(item.originalUrl || '')}</td>
-        <td>${escapeHtml(formatDateTime(item.createdAt))}</td>
-        <td>${escapeHtml(item.apiKeyId ? String(item.apiKeyId) : '—')}</td>
-      </tr>`;
-    }).join('')
-    : '<tr><td colspan="4" class="ui-muted">No records found.</td></tr>';
-
-  const keyRows = adminData.apiKeys.length
-    ? adminData.apiKeys.map((key) => `<tr>
-      <td>${escapeHtml(String(key._id))}</td>
-      <td>${escapeHtml(key.name || '')}</td>
-      <td>${escapeHtml((key.scopes || []).join(', '))}</td>
-      <td>${escapeHtml(key.active ? 'yes' : 'no')}</td>
-      <td>${escapeHtml(formatDateTime(key.lastUsedAt))}</td>
-      <td>${escapeHtml(String(key.usageCount || 0))}</td>
-    </tr>`).join('')
-    : '<tr><td colspan="6" class="ui-muted">No API keys found.</td></tr>';
-
-  return `<section class="ui-card">
-    <div class="ui-admin-header">
-      <h2>Admin overview</h2>
-      <a href="${escapeHtml(apiDocsUrl)}" target="_blank" rel="noopener" class="ui-admin-link">Open API docs</a>
-    </div>
-    <div class="ui-metric-grid">
-      <article><h3>Total</h3><p>${escapeHtml(String(stats.total))}</p></article>
-      <article><h3>Active</h3><p>${escapeHtml(String(stats.active))}</p></article>
-      <article><h3>Expired</h3><p>${escapeHtml(String(stats.expired))}</p></article>
-      <article><h3>Deleted</h3><p>${escapeHtml(String(stats.deleted))}</p></article>
-      <article><h3>Long TTL</h3><p>${escapeHtml(String(stats.longTtl))}</p></article>
-      <article><h3>Purge queued</h3><p>${escapeHtml(String(stats.purgeScheduled))}</p></article>
-    </div>
-  </section>
-  <section class="ui-card">
-    <h2>Recent global URLs</h2>
-    <div class="ui-table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Short URL</th>
-            <th>Original URL</th>
-            <th>Created</th>
-            <th>API key ID</th>
-          </tr>
-        </thead>
-        <tbody>${recentRows}</tbody>
-      </table>
-    </div>
-  </section>
-  <section class="ui-card">
-    <h2>API keys</h2>
-    <div class="ui-table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Name</th>
-            <th>Scopes</th>
-            <th>Active</th>
-            <th>Last used</th>
-            <th>Usage count</th>
-          </tr>
-        </thead>
-        <tbody>${keyRows}</tbody>
-      </table>
-    </div>
-  </section>`;
-}
 
 function requireScope(scope) {
   return (req, res, next) => {

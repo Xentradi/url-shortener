@@ -1,9 +1,15 @@
 // scripts/bootstrap-admin.js
 import crypto from 'crypto';
-import 'dotenv/config';
+import path from 'path';
+import {fileURLToPath} from 'url';
+import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import ApiKey from '../models/apiKeyModel.js';
 import logger from '../logger.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({path: path.resolve(__dirname, '../.env')});
 
 const dbUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/urlShortener';
 const name = process.env.ADMIN_BOOTSTRAP_NAME || 'admin';
